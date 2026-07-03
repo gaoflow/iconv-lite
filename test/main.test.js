@@ -79,6 +79,23 @@ describe("Generic UTF8-UCS2 tests", function () {
     assert.strictEqual(iconv.decode(invalid, "utf8"), "���") // default: replacement, no throw.
   })
 
+  it("Encodes a lone surrogate as U+FFFD, so the output is well-formed UTF-8", function () {
+    assert.strictEqual(iconv.encode("a\ud800b", "utf8").toString("hex"), "61efbfbd62")
+    assert.strictEqual(iconv.encode("\udc00", "utf8").toString("hex"), "efbfbd")
+  })
+
+  it("Encodes a surrogate pair split across writes", function () {
+    var encoder = iconv.getEncoder("utf8")
+    var res = Buffer.concat([encoder.write("a\ud83d"), encoder.write("\ude00b"), encoder.end() || Buffer.alloc(0)])
+    assert.strictEqual(res.toString("utf8"), "a😀b")
+  })
+
+  it("Encodes a high surrogate left unpaired at end() as U+FFFD", function () {
+    var encoder = iconv.getEncoder("utf8")
+    assert.strictEqual(encoder.write("\ud83d").length, 0) // Held back: could pair with the next chunk.
+    assert.strictEqual(encoder.end().toString("hex"), "efbfbd")
+  })
+
   it("Convert non-strings and non-buffers", function () {
     assert.throws(function () {
       iconv.encode({}, "utf8")

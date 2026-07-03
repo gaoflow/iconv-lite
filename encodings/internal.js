@@ -39,7 +39,7 @@ class Utf8Codec {
  */
 class Cesu8Codec {
   createEncoder (options, iconv) { return new Cesu8Encoder() }
-  createDecoder (options, iconv) { return new Cesu8Decoder(iconv.defaultCharUnicode) }
+  createDecoder (options, iconv) { return new Cesu8Decoder(iconv.defaultCharUnicode, !!(options && options.fatal)) }
   get bomAware () { return true }
 }
 
@@ -188,16 +188,30 @@ class Cesu8Encoder {
  * continuation bytes accumulate the code unit, and each completed unit is emitted as-is (surrogate
  * pairs reassemble naturally in the UTF-16 output). Ill-formed input -- an aborted sequence, an
  * unexpected continuation byte, an overlong encoding or a 4-byte lead -- is replaced with the
- * bad-char (U+FFFD by default). Exception: the overlong NULL "C0 80" is accepted for Modified
- * UTF-8 (Java) compatibility. Streaming: the accumulator carries a sequence split across chunks.
+ * bad-char (U+FFFD by default), or throws with { fatal: true }. Exception: the overlong NULL
+ * "C0 80" is accepted for Modified UTF-8 (Java) compatibility. Streaming: the accumulator carries
+ * a sequence split across chunks.
  */
 class Cesu8Decoder {
-  /** @param {string} defaultCharUnicode Replacement for ill-formed input. */
-  constructor (defaultCharUnicode) {
+  /**
+   * @param {string} defaultCharUnicode Replacement for ill-formed input.
+   * @param {boolean} fatal Throw on ill-formed input instead of emitting the replacement.
+   */
+  constructor (defaultCharUnicode, fatal) {
     this.acc = 0
     this.contBytes = 0
     this.accBytes = 0
     this.defaultCharUnicode = defaultCharUnicode
+    this.fatal = fatal
+  }
+
+  /**
+   * Handles one ill-formed sequence: throws when fatal, otherwise hands back the bad-char to append.
+   * @returns {string}
+   */
+  _replacement () {
+    if (this.fatal) { throw new Error("Ill-formed CESU-8 byte sequence") }
+    return this.defaultCharUnicode
   }
 
   /**
@@ -213,7 +227,7 @@ class Cesu8Decoder {
       const curByte = buf[i]
       if ((curByte & 0xC0) !== 0x80) { // Lead byte.
         if (contBytes > 0) { // The previous sequence was aborted: ill-formed.
-          res += this.defaultCharUnicode
+          res += this._replacement()
           contBytes = 0
         }
 
@@ -226,7 +240,7 @@ class Cesu8Decoder {
           acc = curByte & 0x0F
           contBytes = 2; accBytes = 1
         } else { // Four or more bytes are ill-formed in CESU-8 (UTR #26 uses surrogate pairs instead).
-          res += this.defaultCharUnicode
+          res += this._replacement()
         }
       } else { // Continuation byte.
         if (contBytes > 0) { // We're waiting for it.
@@ -235,15 +249,15 @@ class Cesu8Decoder {
           if (contBytes === 0) {
             // Reject overlong encodings, but accept Modified UTF-8's NULL as "C0 80".
             if (accBytes === 2 && acc < 0x80 && acc > 0) {
-              res += this.defaultCharUnicode
+              res += this._replacement()
             } else if (accBytes === 3 && acc < 0x800) {
-              res += this.defaultCharUnicode
+              res += this._replacement()
             } else {
               res += String.fromCharCode(acc)
             }
           }
         } else { // Unexpected continuation byte: ill-formed.
-          res += this.defaultCharUnicode
+          res += this._replacement()
         }
       }
     }
@@ -251,11 +265,12 @@ class Cesu8Decoder {
     return res
   }
 
-  /** @returns {string|number} The bad-char for a sequence left truncated at end of input. */
+  /** @returns {string|undefined} The bad-char for a sequence left truncated at end of input (or throws when fatal). */
   end () {
-    let res = 0
-    if (this.contBytes > 0) { res += this.defaultCharUnicode }
-    return res
+    if (this.contBytes === 0) { return }
+    this.contBytes = 0
+    if (this.fatal) { throw new Error("Truncated CESU-8 sequence at end of input") }
+    return this.defaultCharUnicode
   }
 }
 
