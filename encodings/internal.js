@@ -390,16 +390,24 @@ class Cesu8Decoder {
     }
     this.acc = acc; this.contBytes = contBytes; this.accBytes = accBytes
 
-    // Long surrogate-free output converts in one native call; a surrogate anywhere (a code unit
-    // 0xD800..0xDFFF, the essence of CESU-8) must pass through verbatim, which TextDecoder won't
-    // do for a lone one, so those fall back to the stack-safe fromCharCode path.
+    // Long output converts in one native call unless it holds a LONE surrogate, which must pass
+    // through verbatim and TextDecoder would replace with U+FFFD. Properly paired surrogates (the
+    // normal CESU-8 case) decode natively just fine, so the scan only rejects unpaired ones --
+    // e.g. ill-formed input, or a pair split at a chunk boundary.
     if (pos >= TEXT_DECODER_MIN_UNITS) {
-      let hasSurrogate = false
+      let loneSurrogate = false
       for (let k = 0; k < pos; k++) {
         const unit = units[k]
-        if (unit >= 0xD800 && unit <= 0xDFFF) { hasSurrogate = true; break }
+        if (unit >= 0xD800 && unit <= 0xDFFF) {
+          if (unit < 0xDC00 && k + 1 < pos && units[k + 1] >= 0xDC00 && units[k + 1] <= 0xDFFF) {
+            k++ // A high surrogate followed by a low one: a valid pair.
+            continue
+          }
+          loneSurrogate = true
+          break
+        }
       }
-      if (!hasSurrogate) { return utf16leDecoder.decode(new Uint8Array(units.buffer, 0, pos * 2)) }
+      if (!loneSurrogate) { return utf16leDecoder.decode(new Uint8Array(units.buffer, 0, pos * 2)) }
     }
     return charsFromUnits(units, pos)
   }
@@ -489,29 +497,41 @@ class Base64Encoder {
    */
   write (str) {
     if (this.done) { return this.backend.bytesToResult(new Uint8Array(0), 0) }
+    const full = this.prevStr + str
 
     // "=" ends the stream, like Buffer.from: decode the chars before it as the final quantum.
-    // (this.prevStr is already clean, so only the incoming chunk needs to be searched.)
-    const eq = str.indexOf("=")
-    if (eq !== -1) {
-      this.done = true
-      const bytes = base64ToBytes(this.prevStr + str.slice(0, eq).replace(NON_BASE64, ""))
-      this.prevStr = ""
-      return this.backend.bytesToResult(bytes, bytes.length)
+    const eq = full.indexOf("=")
+    const chunk = eq !== -1 ? full.slice(0, eq) : full.slice(0, full.length - (full.length % 4))
+
+    // Fast path: parse assuming clean base64 (the common case) and verify via the byte count.
+    // Foreign chars make the parser throw (atob/fromBase64), and whitespace is stripped by atob,
+    // shortening the output below 3/4 of the chars -- so a count match proves the chunk was clean
+    // and no realignment (the replace below) is needed.
+    let bytes = null
+    try {
+      const parsed = base64ToBytes(chunk)
+      const parseLen = chunk.length - (chunk.length % 4 === 1 ? 1 : 0) // base64ToBytes drops a dangling char.
+      if (parsed.length === (parseLen * 3) >> 2) { bytes = parsed }
+    } catch (e) {}
+
+    if (bytes === null) {
+      // Dirty input: drop the non-alphabet chars, realign, reparse.
+      const cleaned = full.slice(0, eq !== -1 ? eq : full.length).replace(NON_BASE64, "")
+      const quads = eq !== -1 ? cleaned.length : cleaned.length - (cleaned.length % 4)
+      bytes = base64ToBytes(cleaned.slice(0, quads))
+      this.prevStr = eq !== -1 ? "" : cleaned.slice(quads)
+    } else {
+      this.prevStr = eq !== -1 ? "" : full.slice(chunk.length)
     }
+    if (eq !== -1) { this.done = true }
 
-    // Drop non-alphabet chars, then parse the whole quanta and carry the remainder over.
-    const full = this.prevStr + str.replace(NON_BASE64, "")
-    const completeQuads = full.length - (full.length % 4)
-    this.prevStr = full.slice(completeQuads)
-
-    const bytes = base64ToBytes(full.slice(0, completeQuads))
     return this.backend.bytesToResult(bytes, bytes.length)
   }
 
   /** @returns {Buffer|Uint8Array} Bytes of the remaining (possibly truncated) final quantum. */
   end () {
-    const bytes = base64ToBytes(this.prevStr)
+    // The fast path can carry unverified (non-alphabet) chars over; atob would throw on them.
+    const bytes = base64ToBytes(this.prevStr.replace(NON_BASE64, ""))
     this.prevStr = ""
     this.done = false
     return this.backend.bytesToResult(bytes, bytes.length)
