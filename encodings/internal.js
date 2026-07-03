@@ -86,12 +86,14 @@ function charsFromUnits (units, length) {
 
 /**
  * Parses base64 text (pre-cleaned to alphabet chars only, no padding) into bytes, like Node's
- * forgiving parser: a dangling char (4k+1 length, no whole byte in it) is dropped.
+ * forgiving parser: a dangling char (4k+1 length, no whole byte in it) is dropped. In Node it IS
+ * Buffer's parser, which also beats Uint8Array.fromBase64 below ~100 KB (per-call overhead).
  * @param {string} str
- * @returns {Uint8Array}
+ * @returns {Buffer|Uint8Array}
  */
 function base64ToBytes (str) {
   if (str.length % 4 === 1) { str = str.slice(0, -1) }
+  if (nodeBuffer) { return nodeBuffer.from(str, "base64") }
   if (HAS_FROM_BASE64) { return Uint8Array.fromBase64(str, { lastChunkHandling: "loose" }) }
   const bin = atob(str)
   const bytes = new Uint8Array(bin.length)
@@ -101,10 +103,13 @@ function base64ToBytes (str) {
 
 /**
  * Serializes bytes as base64 text (standard alphabet, padded), like buf.toString("base64").
- * @param {Uint8Array} bytes
+ * Only Buffer instances take the Buffer path, so the portable branches still run (and stay
+ * covered) when a Uint8Array comes in, e.g. under the web backend.
+ * @param {Buffer|Uint8Array} bytes
  * @returns {string}
  */
 function bytesToBase64 (bytes) {
+  if (nodeBuffer && nodeBuffer.isBuffer(bytes)) { return bytes.toString("base64") }
   if (HAS_TO_BASE64) { return bytes.toBase64() }
   return btoa(charsFromUnits(bytes, bytes.length))
 }
@@ -504,9 +509,9 @@ class Base64Encoder {
     const chunk = eq !== -1 ? full.slice(0, eq) : full.slice(0, full.length - (full.length % 4))
 
     // Fast path: parse assuming clean base64 (the common case) and verify via the byte count.
-    // Foreign chars make the parser throw (atob/fromBase64), and whitespace is stripped by atob,
-    // shortening the output below 3/4 of the chars -- so a count match proves the chunk was clean
-    // and no realignment (the replace below) is needed.
+    // Ignored bytes shorten the output below 3/4 of the chars (Buffer skips foreign chars, atob
+    // strips whitespace) and the other parsers throw on them -- either way a count match proves
+    // the chunk was clean and no realignment (the replace below) is needed.
     let bytes = null
     try {
       const parsed = base64ToBytes(chunk)
