@@ -49,28 +49,30 @@ class Cesu8Codec {
  * label, which resolves to windows-1252; that one is served by the sbcs tables.
  */
 class BinaryCodec {
-  createEncoder (options, iconv) { return new RawEncoder("binary") }
-  createDecoder (options, iconv) { return new BufferedStringDecoder("binary") }
+  createEncoder (options, iconv) { return new BinaryEncoder() }
+  createDecoder (options, iconv) { return new BinaryDecoder() }
 }
 
 /**
  * Base64 codec (RFC 4648, Section 4), with Node Buffer's forgiving parser: non-alphabet bytes
- * (whitespace etc.) are ignored and an incomplete trailing quantum is truncated. The encoder is
- * streaming-safe: it only feeds whole 4-char quanta to the parser and carries the tail over to the
- * next write().
+ * (whitespace etc.) are ignored and an incomplete trailing quantum is truncated. Both directions
+ * are streaming-safe: base64 maps 3 bytes <-> one 4-char quantum, so the encoder only feeds whole
+ * quanta to the parser and the decoder only serializes whole 3-byte groups, carrying the remainder
+ * over to the next write().
  */
 class Base64Codec {
   createEncoder (options, iconv) { return new Base64Encoder() }
-  createDecoder (options, iconv) { return new BufferedStringDecoder("base64") }
+  createDecoder (options, iconv) { return new Base64Decoder() }
 }
 
 /**
  * Hex codec (RFC 4648, Section 8, "Base16"), matching Node Buffer's semantics: decoding emits
- * lowercase hex; encoding parses hex pairs and stops at the first invalid or incomplete pair.
+ * lowercase hex; encoding parses hex pairs and stops at the first invalid or incomplete pair. The
+ * encoder is streaming-safe: a pair split across two write() calls is carried over, not dropped.
  */
 class HexCodec {
-  createEncoder (options, iconv) { return new RawEncoder("hex") }
-  createDecoder (options, iconv) { return new BufferedStringDecoder("hex") }
+  createEncoder (options, iconv) { return new HexEncoder() }
+  createDecoder (options, iconv) { return new HexDecoder() }
 }
 
 /**
@@ -275,21 +277,33 @@ class Cesu8Decoder {
 }
 
 /**
- * Encoder for the stateless byte-string transports (binary, hex): each write() hands the textual
- * representation to Buffer.from, which parses it into bytes.
+ * Binary encoder (latin1 text -> bytes): each char becomes the byte `charCode & 0xFF` (Buffer's
+ * "binary"/"latin1" behavior for code points above U+00FF). Stateless.
  */
-class RawEncoder {
-  /** @param {string} enc A Buffer encoding name. */
-  constructor (enc) {
-    this.enc = enc
-  }
-
+class BinaryEncoder {
   /**
    * @param {string} str
    * @returns {Buffer}
    */
   write (str) {
-    return Buffer.from(str, this.enc)
+    return Buffer.from(str, "binary")
+  }
+
+  /** @returns {void} */
+  end () {}
+}
+
+/**
+ * Binary decoder (bytes -> latin1 text): byte value -> code point, 1:1. Stateless, so each chunk
+ * is serialized as it comes in.
+ */
+class BinaryDecoder {
+  /**
+   * @param {Buffer|Uint8Array} buf
+   * @returns {string}
+   */
+  write (buf) {
+    return asBuffer(buf).toString("binary")
   }
 
   /** @returns {void} */
@@ -326,35 +340,108 @@ class Base64Encoder {
 }
 
 /**
- * Decoder for the byte-string transports (binary, base64, hex): bytes -> their textual
- * representation via buf.toString(enc). All input is buffered and serialized in one go at end(),
- * which keeps quantum alignment trivial (base64 must not emit padding mid-stream).
+ * Base64 decoder (bytes -> base64 text). Only whole 3-byte groups are serialized during write()
+ * (they map to whole 4-char quanta, so no padding is emitted mid-stream and the concatenated
+ * chunks equal the base64 of the whole input); the remainder (up to 2 bytes) is carried over, and
+ * end() serializes it as the final, possibly padded, quantum.
  */
-class BufferedStringDecoder {
-  /** @param {string} enc A Buffer encoding name. */
-  constructor (enc) {
-    this.enc = enc
-    this.buffer = Buffer.from("")
+class Base64Decoder {
+  constructor () {
+    this.overflow = Buffer.alloc(3) // Bytes of an incomplete final group, finished by the next chunk.
+    this.overflowLen = 0
   }
 
   /**
    * @param {Buffer|Uint8Array} buf
-   * @returns {string} Always "": output is deferred to end().
+   * @returns {string}
    */
   write (buf) {
-    if (!Buffer.isBuffer(buf)) {
-      buf = Buffer.from(buf)
+    if (this.overflowLen + buf.length < 3) {
+      for (let i = 0; i < buf.length; i++) { this.overflow[this.overflowLen++] = buf[i] }
+      return ""
     }
-    this.buffer = Buffer.concat([this.buffer, buf])
-    return ""
+
+    let res = ""
+    let pos = 0
+    if (this.overflowLen > 0) {
+      // Finish the group that was split across the previous chunk boundary.
+      for (; this.overflowLen < 3; pos++) { this.overflow[this.overflowLen++] = buf[pos] }
+      res = this.overflow.toString("base64")
+      this.overflowLen = 0
+    }
+
+    const groupsEnd = pos + ((buf.length - pos) / 3 | 0) * 3
+    if (groupsEnd > pos) { res += asBuffer(buf).subarray(pos, groupsEnd).toString("base64") }
+
+    for (let i = groupsEnd; i < buf.length; i++) { this.overflow[this.overflowLen++] = buf[i] }
+    return res
   }
 
-  /** @returns {string} The whole input, serialized. */
+  /** @returns {string|undefined} The final quantum, padded per RFC 4648, for 1..2 leftover bytes. */
   end () {
-    const res = this.buffer
-    this.buffer = Buffer.from("")
-    return res.toString(this.enc)
+    if (this.overflowLen === 0) { return }
+    const res = this.overflow.subarray(0, this.overflowLen).toString("base64")
+    this.overflowLen = 0
+    return res
   }
+}
+
+/**
+ * Hex encoder (hex text -> bytes). A byte is a 2-digit pair (RFC 4648, Section 8), so an odd
+ * trailing digit is carried over to the next write() instead of being fed to the parser, which
+ * would drop it as an incomplete pair mid-stream.
+ */
+class HexEncoder {
+  constructor () {
+    this.prevChar = ""
+  }
+
+  /**
+   * @param {string} str
+   * @returns {Buffer}
+   */
+  write (str) {
+    if (this.prevChar) {
+      str = this.prevChar + str
+      this.prevChar = ""
+    }
+    if (str.length % 2 !== 0) {
+      this.prevChar = str[str.length - 1]
+      str = str.slice(0, -1)
+    }
+    return Buffer.from(str, "hex")
+  }
+
+  /** @returns {void} A dangling lone digit is an incomplete pair, dropped like Buffer.from does. */
+  end () {
+    this.prevChar = ""
+  }
+}
+
+/**
+ * Hex decoder (bytes -> hex text): byte -> 2 lowercase digits. Stateless, so each chunk is
+ * serialized as it comes in.
+ */
+class HexDecoder {
+  /**
+   * @param {Buffer|Uint8Array} buf
+   * @returns {string}
+   */
+  write (buf) {
+    return asBuffer(buf).toString("hex")
+  }
+
+  /** @returns {void} */
+  end () {}
+}
+
+/**
+ * Views a Uint8Array as a Buffer without copying, so Buffer.prototype serializers can be used on it.
+ * @param {Buffer|Uint8Array} bytes
+ * @returns {Buffer}
+ */
+function asBuffer (bytes) {
+  return Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes.buffer, bytes.byteOffset, bytes.length)
 }
 
 exports.utf8 = Utf8Codec

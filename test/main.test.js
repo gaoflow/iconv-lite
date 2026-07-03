@@ -56,6 +56,29 @@ describe("Generic UTF8-UCS2 tests", function () {
     assert.strictEqual(iconv.decode(Buffer.from(testString, "binary"), "hex"), testStringHex)
   })
 
+  it("Hex encoding handles chunks split at an odd digit", function () {
+    var encoder = iconv.getEncoder("hex")
+    var parts = [encoder.write("48656"), encoder.write("c6c6f"), encoder.end()].filter(Boolean)
+    assert.strictEqual(Buffer.concat(parts).toString("binary"), "Hello")
+  })
+
+  it("Byte-string decoders emit output incrementally", function () {
+    ["binary", "base64", "hex"].forEach(function (enc) {
+      var whole = iconv.decode(Buffer.from(testString, "binary"), enc)
+      var decoder = iconv.getDecoder(enc)
+      var res = ""
+      var incremental = false
+      for (var i = 0; i < testString.length; i++) {
+        var chunk = decoder.write(Buffer.from(testString[i], "binary"))
+        if (i < testString.length - 1 && chunk.length > 0) { incremental = true }
+        res += chunk
+      }
+      res += decoder.end() || ""
+      assert.strictEqual(res, whole, enc + " chunked output differs from whole-input output")
+      assert.ok(incremental, enc + " should not buffer the whole input")
+    })
+  })
+
   it("Latin1 correctly encoded/decoded", function () {
     assert.strictEqual(iconv.encode(testStringLatin1, "latin1").toString("binary"), testStringLatin1)
     assert.strictEqual(iconv.decode(Buffer.from(testStringLatin1, "binary"), "latin1"), testStringLatin1)
