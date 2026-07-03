@@ -1,11 +1,17 @@
 "use strict"
 
-const Buffer = require("buffer").Buffer
-
 /**
  * Node.js-compatible "internal" codecs: UTF-8, CESU-8 and the byte-string transports binary
  * (latin1), base64 and hex. Their semantics deliberately match Node's Buffer built-ins so that
  * iconv-lite can be used as a drop-in replacement for Buffer-based conversions.
+ *
+ * Browser-native: the conversions only require APIs shared by Node and browsers (TextEncoder,
+ * TextDecoder, atob/btoa and, where available, Uint8Array.fromBase64/toBase64/toHex) plus plain
+ * Uint8Array byte I/O -- the Buffer module is never imported, so browser bundles don't need a
+ * polyfill. When the runtime is Node, the conversion helpers pick the equivalent native Buffer
+ * implementation instead, which is the fastest one there; the iconv-lite backend is touched only
+ * for the encoders' final "bytes -> result" step, so encoding keeps returning a Buffer in Node
+ * (like the utf16/utf32 codecs).
  *
  * Note the direction of the byte-string transports (binary/base64/hex): encode() parses the
  * *textual representation* into bytes and decode() serializes bytes back into that representation,
@@ -24,9 +30,49 @@ const TEXT_DECODER_MIN_UNITS = 64
  */
 const utf16leDecoder = new TextDecoder("utf-16le", { ignoreBOM: true })
 
+/** Shared TextEncoder, encodes a string to well-formed UTF-8 bytes in one native call. @type {TextEncoder} */
+const utf8Encoder = new TextEncoder()
+
 /**
- * Builds a string from the first `length` code units of a Uint16Array, in stack-safe chunks.
- * @param {Uint16Array} units
+ * The native Buffer class when running in Node, else null. Buffer's built-in conversions are
+ * several times faster than the portable paths below (they're what these codecs emulate), so the
+ * helpers use them whenever they're available. Detected via process.versions.node so that a
+ * bundler-injected Buffer polyfill (slower than the portable paths) doesn't take these shortcuts.
+ */
+const nodeBuffer = typeof process !== "undefined" && process.versions && process.versions.node &&
+  typeof Buffer === "function"
+  ? Buffer
+  : null
+
+/** Whether the runtime has Uint8Array.fromBase64 (Node 25+, modern browsers). */
+const HAS_FROM_BASE64 = typeof Uint8Array.fromBase64 === "function"
+/** Whether the runtime has Uint8Array.prototype.toBase64 (Node 25+, modern browsers). */
+const HAS_TO_BASE64 = typeof Uint8Array.prototype.toBase64 === "function"
+/** Whether the runtime has Uint8Array.prototype.toHex (Node 25+, modern browsers). */
+const HAS_TO_HEX = typeof Uint8Array.prototype.toHex === "function"
+
+/** Matches every char outside the base64 alphabet, including padding (see Base64Encoder). @type {RegExp} */
+const NON_BASE64 = /[^A-Za-z0-9+/]/g
+
+/**
+ * Hex digit -> value table, indexed by char code & 0xFF (Buffer masks the code the same way, so
+ * e.g. U+0130 parses as its low byte 0x30, "0"); -1 marks a non-digit. @type {Int8Array}
+ */
+const HEX_VALUES = new Int8Array(256).fill(-1)
+for (let digit = 0; digit < 16; digit++) {
+  HEX_VALUES["0123456789abcdef".charCodeAt(digit)] = digit
+  HEX_VALUES["0123456789ABCDEF".charCodeAt(digit)] = digit
+}
+
+/** Byte value -> its 2 lowercase hex digits. @type {string[]} */
+const HEX_CHARS = new Array(256)
+for (let byte = 0; byte < 256; byte++) {
+  HEX_CHARS[byte] = ((byte >> 4) & 0xF).toString(16) + (byte & 0xF).toString(16)
+}
+
+/**
+ * Builds a string from the first `length` code units of an array-like, in stack-safe chunks.
+ * @param {Uint16Array|Uint8Array} units
  * @param {number} length Number of valid code units in `units`.
  * @returns {string}
  */
@@ -39,20 +85,44 @@ function charsFromUnits (units, length) {
 }
 
 /**
+ * Parses base64 text (pre-cleaned to alphabet chars only, no padding) into bytes, like Node's
+ * forgiving parser: a dangling char (4k+1 length, no whole byte in it) is dropped.
+ * @param {string} str
+ * @returns {Uint8Array}
+ */
+function base64ToBytes (str) {
+  if (str.length % 4 === 1) { str = str.slice(0, -1) }
+  if (HAS_FROM_BASE64) { return Uint8Array.fromBase64(str, { lastChunkHandling: "loose" }) }
+  const bin = atob(str)
+  const bytes = new Uint8Array(bin.length)
+  for (let i = 0; i < bin.length; i++) { bytes[i] = bin.charCodeAt(i) }
+  return bytes
+}
+
+/**
+ * Serializes bytes as base64 text (standard alphabet, padded), like buf.toString("base64").
+ * @param {Uint8Array} bytes
+ * @returns {string}
+ */
+function bytesToBase64 (bytes) {
+  if (HAS_TO_BASE64) { return bytes.toBase64() }
+  return btoa(charsFromUnits(bytes, bytes.length))
+}
+
+/**
  * UTF-8 codec.
  *
- * Decoding uses the WHATWG-standard TextDecoder (available in both Node and browsers), so it
- * conforms to the Encoding Standard's "UTF-8 decode": ill-formed sequences (RFC 3629 / Unicode
- * Standard, Section 3.9, definition D92) are replaced with U+FFFD following the maximal-subpart
- * rule, or throw with { fatal: true }. Streaming (sequences split across chunks) is handled by
- * TextDecoder itself.
+ * Decoding uses the WHATWG-standard TextDecoder, so it conforms to the Encoding Standard's "UTF-8
+ * decode": ill-formed sequences (RFC 3629 / Unicode Standard, Section 3.9, definition D92) are
+ * replaced with U+FFFD following the maximal-subpart rule, or throw with { fatal: true }.
+ * Streaming (sequences split across chunks) is handled by TextDecoder itself.
  *
  * Encoding produces well-formed UTF-8: a lone (unpaired) surrogate is replaced with U+FFFD, the
  * same result as the WHATWG "UTF-8 encode" of a USVString. The encoder is streaming-safe: a
  * surrogate pair split across two write() calls is held over and encoded whole.
  */
 class Utf8Codec {
-  createEncoder (options, iconv) { return new Utf8Encoder() }
+  createEncoder (options, iconv) { return new Utf8Encoder(iconv.backend) }
   createDecoder (options, iconv) { return new Utf8Decoder(options) }
   get bomAware () { return true }
 }
@@ -64,7 +134,7 @@ class Utf8Codec {
  * UTF-8's 4.
  */
 class Cesu8Codec {
-  createEncoder (options, iconv) { return new Cesu8Encoder() }
+  createEncoder (options, iconv) { return new Cesu8Encoder(iconv.backend) }
   createDecoder (options, iconv) { return new Cesu8Decoder(iconv.defaultCharUnicode, !!(options && options.fatal)) }
   get bomAware () { return true }
 }
@@ -75,46 +145,50 @@ class Cesu8Codec {
  * label, which resolves to windows-1252; that one is served by the sbcs tables.
  */
 class BinaryCodec {
-  createEncoder (options, iconv) { return new BinaryEncoder() }
+  createEncoder (options, iconv) { return new BinaryEncoder(iconv.backend) }
   createDecoder (options, iconv) { return new BinaryDecoder() }
 }
 
 /**
  * Base64 codec (RFC 4648, Section 4), with Node Buffer's forgiving parser: non-alphabet bytes
- * (whitespace etc.) are ignored and an incomplete trailing quantum is truncated. Both directions
- * are streaming-safe: base64 maps 3 bytes <-> one 4-char quantum, so the encoder only feeds whole
- * quanta to the parser and the decoder only serializes whole 3-byte groups, carrying the remainder
- * over to the next write().
+ * (whitespace etc.) are ignored, the first "=" terminates the input, and an incomplete trailing
+ * quantum is truncated. Both directions are streaming-safe: base64 maps 3 bytes <-> one 4-char
+ * quantum, so the encoder only parses whole quanta and the decoder only serializes whole 3-byte
+ * groups, carrying the remainder over to the next write().
  */
 class Base64Codec {
-  createEncoder (options, iconv) { return new Base64Encoder() }
+  createEncoder (options, iconv) { return new Base64Encoder(iconv.backend) }
   createDecoder (options, iconv) { return new Base64Decoder() }
 }
 
 /**
  * Hex codec (RFC 4648, Section 8, "Base16"), matching Node Buffer's semantics: decoding emits
- * lowercase hex; encoding parses hex pairs and stops at the first invalid or incomplete pair. The
- * encoder is streaming-safe: a pair split across two write() calls is carried over, not dropped.
+ * lowercase hex; encoding parses hex pairs (either case) and stops at the first invalid or
+ * incomplete pair. The encoder is streaming-safe: a pair split across two write() calls is carried
+ * over, not dropped.
  */
 class HexCodec {
-  createEncoder (options, iconv) { return new HexEncoder() }
+  createEncoder (options, iconv) { return new HexEncoder(iconv.backend) }
   createDecoder (options, iconv) { return new HexDecoder() }
 }
 
 /**
- * UTF-8 encoder. Delegates the conversion to Buffer.from(str, "utf8"), which encodes each Unicode
- * scalar value per RFC 3629 and replaces a lone surrogate with U+FFFD. The only state is chunk
- * stitching: a high surrogate at the very end of a write() may be the first half of a pair whose
- * low half arrives in the next chunk, so it is held back instead of being encoded (ill-formed) now.
+ * UTF-8 encoder. Delegates the conversion to Buffer.from(str, "utf8") in Node or TextEncoder
+ * elsewhere; both encode each Unicode scalar value per RFC 3629 and replace a lone surrogate with
+ * U+FFFD. The only state is chunk stitching: a high surrogate at the very end of a write() may be
+ * the first half of a pair whose low half arrives in the next chunk, so it is held back instead of
+ * being encoded (ill-formed) now.
  */
 class Utf8Encoder {
-  constructor () {
+  /** @param {object} backend The iconv-lite backend (its bytesToResult turns bytes into a Buffer/Uint8Array). */
+  constructor (backend) {
+    this.backend = backend
     this.highSurrogate = ""
   }
 
   /**
    * @param {string} str
-   * @returns {Buffer}
+   * @returns {Buffer|Uint8Array}
    */
   write (str) {
     if (this.highSurrogate) {
@@ -130,16 +204,26 @@ class Utf8Encoder {
       }
     }
 
-    return Buffer.from(str, "utf8")
+    return this._encode(str)
   }
 
-  /** @returns {Buffer|undefined} U+FFFD (as EF BF BD) for a high surrogate left unpaired at end of input. */
+  /** @returns {Buffer|Uint8Array|undefined} U+FFFD (as EF BF BD) for a high surrogate left unpaired at end of input. */
   end () {
     if (this.highSurrogate) {
       const str = this.highSurrogate
       this.highSurrogate = ""
-      return Buffer.from(str, "utf8")
+      return this._encode(str)
     }
+  }
+
+  /**
+   * @param {string} str
+   * @returns {Buffer|Uint8Array}
+   */
+  _encode (str) {
+    if (nodeBuffer) { return nodeBuffer.from(str, "utf8") }
+    const bytes = utf8Encoder.encode(str)
+    return this.backend.bytesToResult(bytes, bytes.length)
   }
 }
 
@@ -182,28 +266,32 @@ class Utf8Decoder {
  * CESU-8 rather than UTF-8. No state is needed: a pair split across chunks encodes the same way.
  */
 class Cesu8Encoder {
+  /** @param {object} backend */
+  constructor (backend) {
+    this.backend = backend
+  }
+
   /**
    * @param {string} str
-   * @returns {Buffer}
+   * @returns {Buffer|Uint8Array}
    */
   write (str) {
-    // allocUnsafe skips the zero-fill; every byte up to bufIdx is written below.
-    const buf = Buffer.allocUnsafe(str.length * 3)
-    let bufIdx = 0
+    const out = new Uint8Array(str.length * 3)
+    let pos = 0
     for (let i = 0; i < str.length; i++) {
       const charCode = str.charCodeAt(i)
       if (charCode < 0x80) {
-        buf[bufIdx++] = charCode
+        out[pos++] = charCode
       } else if (charCode < 0x800) {
-        buf[bufIdx++] = 0xC0 + (charCode >>> 6)
-        buf[bufIdx++] = 0x80 + (charCode & 0x3f)
+        out[pos++] = 0xC0 + (charCode >>> 6)
+        out[pos++] = 0x80 + (charCode & 0x3f)
       } else { // charCode is always < 0x10000 (it is a UTF-16 code unit).
-        buf[bufIdx++] = 0xE0 + (charCode >>> 12)
-        buf[bufIdx++] = 0x80 + ((charCode >>> 6) & 0x3f)
-        buf[bufIdx++] = 0x80 + (charCode & 0x3f)
+        out[pos++] = 0xE0 + (charCode >>> 12)
+        out[pos++] = 0x80 + ((charCode >>> 6) & 0x3f)
+        out[pos++] = 0x80 + (charCode & 0x3f)
       }
     }
-    return buf.subarray(0, bufIdx)
+    return this.backend.bytesToResult(out, pos)
   }
 
   /** @returns {void} */
@@ -211,15 +299,15 @@ class Cesu8Encoder {
 }
 
 /**
- * CESU-8 decoder (UTR #26). Node has no native CESU-8 decoding (its "utf8" decoder correctly
- * rejects surrogate byte sequences as ill-formed UTF-8), so this is a hand-rolled state machine:
- * a lead byte selects the sequence length (1..3 bytes; 4-byte lead bytes are ill-formed in CESU-8),
- * continuation bytes accumulate the code unit, and each completed unit is emitted as-is (surrogate
- * pairs reassemble naturally in the UTF-16 output). Ill-formed input -- an aborted sequence, an
- * unexpected continuation byte, an overlong encoding or a 4-byte lead -- is replaced with the
- * bad-char (U+FFFD by default), or throws with { fatal: true }. Exception: the overlong NULL
- * "C0 80" is accepted for Modified UTF-8 (Java) compatibility. Streaming: the accumulator carries
- * a sequence split across chunks.
+ * CESU-8 decoder (UTR #26). There is no native CESU-8 decoding (a WHATWG "utf-8" TextDecoder
+ * correctly rejects surrogate byte sequences as ill-formed UTF-8), so this is a hand-rolled state
+ * machine: a lead byte selects the sequence length (1..3 bytes; 4-byte lead bytes are ill-formed
+ * in CESU-8), continuation bytes accumulate the code unit, and each completed unit is emitted
+ * as-is (surrogate pairs reassemble naturally in the UTF-16 output). Ill-formed input -- an
+ * aborted sequence, an unexpected continuation byte, an overlong encoding or a 4-byte lead -- is
+ * replaced with the bad-char (U+FFFD by default), or throws with { fatal: true }. Exception: the
+ * overlong NULL "C0 80" is accepted for Modified UTF-8 (Java) compatibility. Streaming: the
+ * accumulator carries a sequence split across chunks.
  */
 class Cesu8Decoder {
   /**
@@ -330,12 +418,20 @@ class Cesu8Decoder {
  * "binary"/"latin1" behavior for code points above U+00FF). Stateless.
  */
 class BinaryEncoder {
+  /** @param {object} backend */
+  constructor (backend) {
+    this.backend = backend
+  }
+
   /**
    * @param {string} str
-   * @returns {Buffer}
+   * @returns {Buffer|Uint8Array}
    */
   write (str) {
-    return Buffer.from(str, "binary")
+    if (nodeBuffer) { return nodeBuffer.from(str, "binary") }
+    const out = new Uint8Array(str.length)
+    for (let i = 0; i < str.length; i++) { out[i] = str.charCodeAt(i) & 0xFF }
+    return this.backend.bytesToResult(out, out.length)
   }
 
   /** @returns {void} */
@@ -344,15 +440,28 @@ class BinaryEncoder {
 
 /**
  * Binary decoder (bytes -> latin1 text): byte value -> code point, 1:1. Stateless, so each chunk
- * is serialized as it comes in.
+ * is serialized as it comes in. Without Buffer, long chunks are widened into a reusable
+ * Uint16Array and converted in one native TextDecoder call (safe: values <= 0xFF are never
+ * surrogates).
  */
 class BinaryDecoder {
+  constructor () {
+    this.units = new Uint16Array(0) // Reused across writes; grows lazily.
+  }
+
   /**
    * @param {Buffer|Uint8Array} buf
    * @returns {string}
    */
   write (buf) {
-    return asBuffer(buf).toString("binary")
+    if (nodeBuffer && nodeBuffer.isBuffer(buf)) { return buf.toString("binary") }
+    if (buf.length >= TEXT_DECODER_MIN_UNITS) {
+      if (this.units.length < buf.length) { this.units = new Uint16Array(buf.length) }
+      const units = this.units
+      for (let i = 0; i < buf.length; i++) { units[i] = buf[i] }
+      return utf16leDecoder.decode(new Uint8Array(units.buffer, 0, buf.length * 2))
+    }
+    return charsFromUnits(buf, buf.length)
   }
 
   /** @returns {void} */
@@ -360,31 +469,52 @@ class BinaryDecoder {
 }
 
 /**
- * Base64 encoder (base64 text -> bytes). Base64 works in 4-char quanta (RFC 4648, Section 4), so
- * only the complete quanta of each write() are parsed; the remainder (up to 3 chars) is carried
- * over, otherwise Buffer.from would mis-parse it as a truncated final quantum.
+ * Base64 encoder (base64 text -> bytes), with Node Buffer's exact parsing semantics: non-alphabet
+ * chars (whitespace etc.) are ignored, and the first "=" terminates the input -- its quantum is
+ * finished and everything after it is discarded. Streaming-safe: only whole 4-char quanta
+ * (RFC 4648, Section 4) are parsed per write(); the remainder (up to 3 chars) is carried over,
+ * otherwise it would mis-parse as a truncated final quantum.
  */
 class Base64Encoder {
-  constructor () {
+  /** @param {object} backend */
+  constructor (backend) {
+    this.backend = backend
     this.prevStr = ""
+    this.done = false // Whether a "=" terminator has been consumed (all further input is discarded).
   }
 
   /**
    * @param {string} str
-   * @returns {Buffer}
+   * @returns {Buffer|Uint8Array}
    */
   write (str) {
-    str = this.prevStr + str
-    const completeQuads = str.length - (str.length % 4)
-    this.prevStr = str.slice(completeQuads)
-    str = str.slice(0, completeQuads)
+    if (this.done) { return this.backend.bytesToResult(new Uint8Array(0), 0) }
 
-    return Buffer.from(str, "base64")
+    // "=" ends the stream, like Buffer.from: decode the chars before it as the final quantum.
+    // (this.prevStr is already clean, so only the incoming chunk needs to be searched.)
+    const eq = str.indexOf("=")
+    if (eq !== -1) {
+      this.done = true
+      const bytes = base64ToBytes(this.prevStr + str.slice(0, eq).replace(NON_BASE64, ""))
+      this.prevStr = ""
+      return this.backend.bytesToResult(bytes, bytes.length)
+    }
+
+    // Drop non-alphabet chars, then parse the whole quanta and carry the remainder over.
+    const full = this.prevStr + str.replace(NON_BASE64, "")
+    const completeQuads = full.length - (full.length % 4)
+    this.prevStr = full.slice(completeQuads)
+
+    const bytes = base64ToBytes(full.slice(0, completeQuads))
+    return this.backend.bytesToResult(bytes, bytes.length)
   }
 
-  /** @returns {Buffer} Bytes of the remaining (possibly padded or truncated) final quantum. */
+  /** @returns {Buffer|Uint8Array} Bytes of the remaining (possibly truncated) final quantum. */
   end () {
-    return Buffer.from(this.prevStr, "base64")
+    const bytes = base64ToBytes(this.prevStr)
+    this.prevStr = ""
+    this.done = false
+    return this.backend.bytesToResult(bytes, bytes.length)
   }
 }
 
@@ -392,11 +522,11 @@ class Base64Encoder {
  * Base64 decoder (bytes -> base64 text). Only whole 3-byte groups are serialized during write()
  * (they map to whole 4-char quanta, so no padding is emitted mid-stream and the concatenated
  * chunks equal the base64 of the whole input); the remainder (up to 2 bytes) is carried over, and
- * end() serializes it as the final, possibly padded, quantum.
+ * end() serializes it as the final, padded, quantum.
  */
 class Base64Decoder {
   constructor () {
-    this.overflow = Buffer.alloc(3) // Bytes of an incomplete final group, finished by the next chunk.
+    this.overflow = new Uint8Array(3) // Bytes of an incomplete final group, finished by the next chunk.
     this.overflowLen = 0
   }
 
@@ -415,12 +545,12 @@ class Base64Decoder {
     if (this.overflowLen > 0) {
       // Finish the group that was split across the previous chunk boundary.
       for (; this.overflowLen < 3; pos++) { this.overflow[this.overflowLen++] = buf[pos] }
-      res = this.overflow.toString("base64")
+      res = bytesToBase64(this.overflow)
       this.overflowLen = 0
     }
 
     const groupsEnd = pos + ((buf.length - pos) / 3 | 0) * 3
-    if (groupsEnd > pos) { res += asBuffer(buf).subarray(pos, groupsEnd).toString("base64") }
+    if (groupsEnd > pos) { res += bytesToBase64(buf.subarray(pos, groupsEnd)) }
 
     for (let i = groupsEnd; i < buf.length; i++) { this.overflow[this.overflowLen++] = buf[i] }
     return res
@@ -429,25 +559,27 @@ class Base64Decoder {
   /** @returns {string|undefined} The final quantum, padded per RFC 4648, for 1..2 leftover bytes. */
   end () {
     if (this.overflowLen === 0) { return }
-    const res = this.overflow.subarray(0, this.overflowLen).toString("base64")
+    const res = bytesToBase64(this.overflow.subarray(0, this.overflowLen))
     this.overflowLen = 0
     return res
   }
 }
 
 /**
- * Hex encoder (hex text -> bytes). A byte is a 2-digit pair (RFC 4648, Section 8), so an odd
- * trailing digit is carried over to the next write() instead of being fed to the parser, which
- * would drop it as an incomplete pair mid-stream.
+ * Hex encoder (hex text -> bytes). A byte is a 2-digit pair (RFC 4648, Section 8); like Buffer,
+ * parsing stops at the first invalid pair and an odd trailing digit is carried over to the next
+ * write() instead of being dropped as an incomplete pair mid-stream.
  */
 class HexEncoder {
-  constructor () {
+  /** @param {object} backend */
+  constructor (backend) {
+    this.backend = backend
     this.prevChar = ""
   }
 
   /**
    * @param {string} str
-   * @returns {Buffer}
+   * @returns {Buffer|Uint8Array}
    */
   write (str) {
     if (this.prevChar) {
@@ -458,7 +590,17 @@ class HexEncoder {
       this.prevChar = str[str.length - 1]
       str = str.slice(0, -1)
     }
-    return Buffer.from(str, "hex")
+
+    if (nodeBuffer) { return nodeBuffer.from(str, "hex") }
+    const out = new Uint8Array(str.length >> 1)
+    let pos = 0
+    for (let i = 0; i < str.length; i += 2) {
+      const hi = HEX_VALUES[str.charCodeAt(i) & 0xFF]
+      const lo = HEX_VALUES[str.charCodeAt(i + 1) & 0xFF]
+      if (hi < 0 || lo < 0) { break } // Stop at the first invalid pair, like Buffer.from(str, "hex").
+      out[pos++] = (hi << 4) | lo
+    }
+    return this.backend.bytesToResult(out, pos)
   }
 
   /** @returns {void} A dangling lone digit is an incomplete pair, dropped like Buffer.from does. */
@@ -477,20 +619,15 @@ class HexDecoder {
    * @returns {string}
    */
   write (buf) {
-    return asBuffer(buf).toString("hex")
+    if (nodeBuffer && nodeBuffer.isBuffer(buf)) { return buf.toString("hex") }
+    if (HAS_TO_HEX) { return buf.toHex() }
+    let res = ""
+    for (let i = 0; i < buf.length; i++) { res += HEX_CHARS[buf[i]] }
+    return res
   }
 
   /** @returns {void} */
   end () {}
-}
-
-/**
- * Views a Uint8Array as a Buffer without copying, so Buffer.prototype serializers can be used on it.
- * @param {Buffer|Uint8Array} bytes
- * @returns {Buffer}
- */
-function asBuffer (bytes) {
-  return Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes.buffer, bytes.byteOffset, bytes.length)
 }
 
 exports.utf8 = Utf8Codec
