@@ -12,6 +12,32 @@ const Buffer = require("buffer").Buffer
  * mirroring Buffer.from(str, enc) / buf.toString(enc).
  */
 
+/** Max args for one String.fromCharCode.apply() before risking a call-stack overflow. */
+const CHARS_CHUNK = 8192
+/** Above this many code units the native TextDecoder beats fromCharCode; below it the per-call setup costs more. */
+const TEXT_DECODER_MIN_UNITS = 64
+/**
+ * Turns decoded UTF-16 code units (held in a Uint16Array, native little-endian) into a string in
+ * one native call. Only used for runs with no surrogate (where it equals the verbatim conversion),
+ * since it would otherwise replace a lone surrogate with U+FFFD instead of passing it through.
+ * @type {TextDecoder}
+ */
+const utf16leDecoder = new TextDecoder("utf-16le", { ignoreBOM: true })
+
+/**
+ * Builds a string from the first `length` code units of a Uint16Array, in stack-safe chunks.
+ * @param {Uint16Array} units
+ * @param {number} length Number of valid code units in `units`.
+ * @returns {string}
+ */
+function charsFromUnits (units, length) {
+  let result = ""
+  for (let offset = 0; offset < length; offset += CHARS_CHUNK) {
+    result += String.fromCharCode.apply(null, units.subarray(offset, Math.min(offset + CHARS_CHUNK, length)))
+  }
+  return result
+}
+
 /**
  * UTF-8 codec.
  *
@@ -161,7 +187,8 @@ class Cesu8Encoder {
    * @returns {Buffer}
    */
   write (str) {
-    const buf = Buffer.alloc(str.length * 3)
+    // allocUnsafe skips the zero-fill; every byte up to bufIdx is written below.
+    const buf = Buffer.allocUnsafe(str.length * 3)
     let bufIdx = 0
     for (let i = 0; i < str.length; i++) {
       const charCode = str.charCodeAt(i)
@@ -205,15 +232,20 @@ class Cesu8Decoder {
     this.accBytes = 0
     this.defaultCharUnicode = defaultCharUnicode
     this.fatal = fatal
+    this.units = new Uint16Array(0) // Decoded code units, reused across writes; grows lazily.
   }
 
   /**
-   * Handles one ill-formed sequence: throws when fatal, otherwise hands back the bad-char to append.
-   * @returns {string}
+   * Handles one ill-formed sequence: throws when fatal, otherwise appends the bad-char's code units.
+   * @param {Uint16Array} units
+   * @param {number} pos Current code-unit write position.
+   * @returns {number} The new code-unit write position.
    */
-  _replacement () {
+  _replacement (units, pos) {
     if (this.fatal) { throw new Error("Ill-formed CESU-8 byte sequence") }
-    return this.defaultCharUnicode
+    const badChar = this.defaultCharUnicode
+    for (let i = 0; i < badChar.length; i++) { units[pos++] = badChar.charCodeAt(i) }
+    return pos
   }
 
   /**
@@ -224,17 +256,22 @@ class Cesu8Decoder {
     let acc = this.acc
     let contBytes = this.contBytes
     let accBytes = this.accBytes
-    let res = ""
+    // Worst case is one unit per byte, or the bad-char per byte if it's longer than one unit.
+    const maxUnits = buf.length * Math.max(1, this.defaultCharUnicode.length) + 1
+    if (this.units.length < maxUnits) { this.units = new Uint16Array(maxUnits) }
+    const units = this.units
+    let pos = 0
+
     for (let i = 0; i < buf.length; i++) {
       const curByte = buf[i]
       if ((curByte & 0xC0) !== 0x80) { // Lead byte.
         if (contBytes > 0) { // The previous sequence was aborted: ill-formed.
-          res += this._replacement()
+          pos = this._replacement(units, pos)
           contBytes = 0
         }
 
         if (curByte < 0x80) { // Single-byte code unit.
-          res += String.fromCharCode(curByte)
+          units[pos++] = curByte
         } else if (curByte < 0xE0) { // Two-byte sequence.
           acc = curByte & 0x1F
           contBytes = 1; accBytes = 1
@@ -242,7 +279,7 @@ class Cesu8Decoder {
           acc = curByte & 0x0F
           contBytes = 2; accBytes = 1
         } else { // Four or more bytes are ill-formed in CESU-8 (UTR #26 uses surrogate pairs instead).
-          res += this._replacement()
+          pos = this._replacement(units, pos)
         }
       } else { // Continuation byte.
         if (contBytes > 0) { // We're waiting for it.
@@ -251,20 +288,32 @@ class Cesu8Decoder {
           if (contBytes === 0) {
             // Reject overlong encodings, but accept Modified UTF-8's NULL as "C0 80".
             if (accBytes === 2 && acc < 0x80 && acc > 0) {
-              res += this._replacement()
+              pos = this._replacement(units, pos)
             } else if (accBytes === 3 && acc < 0x800) {
-              res += this._replacement()
+              pos = this._replacement(units, pos)
             } else {
-              res += String.fromCharCode(acc)
+              units[pos++] = acc
             }
           }
         } else { // Unexpected continuation byte: ill-formed.
-          res += this._replacement()
+          pos = this._replacement(units, pos)
         }
       }
     }
     this.acc = acc; this.contBytes = contBytes; this.accBytes = accBytes
-    return res
+
+    // Long surrogate-free output converts in one native call; a surrogate anywhere (a code unit
+    // 0xD800..0xDFFF, the essence of CESU-8) must pass through verbatim, which TextDecoder won't
+    // do for a lone one, so those fall back to the stack-safe fromCharCode path.
+    if (pos >= TEXT_DECODER_MIN_UNITS) {
+      let hasSurrogate = false
+      for (let k = 0; k < pos; k++) {
+        const unit = units[k]
+        if (unit >= 0xD800 && unit <= 0xDFFF) { hasSurrogate = true; break }
+      }
+      if (!hasSurrogate) { return utf16leDecoder.decode(new Uint8Array(units.buffer, 0, pos * 2)) }
+    }
+    return charsFromUnits(units, pos)
   }
 
   /** @returns {string|undefined} The bad-char for a sequence left truncated at end of input (or throws when fatal). */
