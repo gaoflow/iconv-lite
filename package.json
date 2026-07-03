@@ -46,7 +46,7 @@
         "stream": false
     },
     "devDependencies": {
-        "@arethetypeswrong/cli": "^0.17.4",
+        "@arethetypeswrong/cli": "^0.18.4",
         "@stylistic/eslint-plugin": "^5.1.0",
         "@stylistic/eslint-plugin-js": "^4.1.0",
         "@types/node": "^24.0.12",
